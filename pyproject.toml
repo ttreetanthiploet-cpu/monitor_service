@@ -1,0 +1,20 @@
+[project]
+name = "n8n-monitor"
+version = "0.1.0"
+description = "n8n execution monitor — polls n8n API and writes to Supabase"
+requires-python = ">=3.12"
+dependencies = [
+    "requests==2.32.3",
+    "supabase==2.10.0",
+    "python-dotenv==1.0.1",
+]
+
+[project.scripts]
+n8n-monitor = "src.monitor:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
