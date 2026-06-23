@@ -79,6 +79,76 @@ WORKFLOW_REGISTRY: dict[str, dict] = {
         "subworkflow_flag_map": {},
         "default_route": "advisor",
     },
+
+    # Sub-workflow: intent classification
+    "2FXKHDFj5TzZmU1X": {
+        "name":                   "Intent_classification",
+        "trigger_node":           "Start",
+        "trigger_is_webhook":     False,
+        "final_output_nodes":     [],
+        "agent_node_map":         {},
+        "lm_subnode_map":         {},
+        "http_node_map":          {},
+        "http_request_body_source": None,
+        "subworkflow_flag_map":   {},
+        "default_route":          None,
+    },
+
+    # Sub-workflow: education / RAG retrieval
+    "FlV6JNP0eI9uUuQC": {
+        "name":                   "Education v1.3",
+        "trigger_node":           "Start",
+        "trigger_is_webhook":     False,
+        "final_output_nodes":     [],
+        "agent_node_map":         {},
+        "lm_subnode_map":         {},
+        "http_node_map":          {},
+        "http_request_body_source": None,
+        "subworkflow_flag_map":   {},
+        "default_route":          None,
+    },
+
+    # Sub-workflow: output guardrail
+    "Lj62jSjq0LXEwvCI": {
+        "name":                   "output Guardrail",
+        "trigger_node":           "Start",
+        "trigger_is_webhook":     False,
+        "final_output_nodes":     [],
+        "agent_node_map":         {},
+        "lm_subnode_map":         {},
+        "http_node_map":          {},
+        "http_request_body_source": None,
+        "subworkflow_flag_map":   {},
+        "default_route":          None,
+    },
+
+    # Sub-workflow: summary generation
+    "osHzEzfm0Nye2RFl": {
+        "name":                   "Summary Workflow",
+        "trigger_node":           "Start",
+        "trigger_is_webhook":     False,
+        "final_output_nodes":     [],
+        "agent_node_map":         {},
+        "lm_subnode_map":         {},
+        "http_node_map":          {},
+        "http_request_body_source": None,
+        "subworkflow_flag_map":   {},
+        "default_route":          None,
+    },
+
+    # Sub-workflow: input guardrail
+    "rG7kIvCmskZEEvjV": {
+        "name":                   "Input Guardrail",
+        "trigger_node":           "Start",
+        "trigger_is_webhook":     False,
+        "final_output_nodes":     [],
+        "agent_node_map":         {},
+        "lm_subnode_map":         {},
+        "http_node_map":          {},
+        "http_request_body_source": None,
+        "subworkflow_flag_map":   {},
+        "default_route":          None,
+    },
 }
 
 _DEFAULT_CONFIG: dict = {
@@ -722,5 +792,24 @@ class ExecutionParser:
             # This IS the advisor execution
             flags["used_advisor"]      = True
             flags["advisor_http_call"] = "HTTP Request" in run_data and len(run_data["HTTP Request"]) > 0
+
+        elif wf_name == "Intent_classification":
+            flags["used_classification"] = True
+
+        elif wf_name == "Input Guardrail":
+            flags["used_input_guardrail"] = True
+
+        elif wf_name == "output Guardrail":
+            flags["used_output_guardrail"] = True
+
+        elif wf_name == "Summary Workflow":
+            flags["used_summary"]           = True
+            flags["summary_storage_upload"] = True
+
+        elif wf_name == "Education v1.3":
+            flags["used_education"] = True
+            flags["education_embedding_used"] = (
+                "LLM - Retrieve" in run_data and bool(run_data["LLM - Retrieve"])
+            )
 
         return flags
