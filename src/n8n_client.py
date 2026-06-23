@@ -58,7 +58,7 @@ class N8NClient:
         cursor: Optional[str] = None
 
         while True:
-            page = self.fetch_executions(workflow_id, after_cursor=cursor)
+            page = self.fetch_executions(workflow_id, after_cursor=cursor, limit=Config.N8N_FETCH_LIMIT)
             batch = page.get("data", [])
             next_cursor = page.get("nextCursor")
 

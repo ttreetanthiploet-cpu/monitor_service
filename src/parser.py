@@ -138,11 +138,13 @@ def _find_usage(obj: Any) -> Optional[dict]:
 def _normalize_usage(usage: dict) -> dict[str, int]:
     inp = (
         usage.get("promptTokens") or usage.get("prompt_tokens")
-        or usage.get("inputTokens") or usage.get("input_tokens") or 0
+        or usage.get("inputTokens") or usage.get("input_tokens")
+        or usage.get("promptTokenCount") or 0  # Gemini usageMetadata format
     )
     out = (
         usage.get("completionTokens") or usage.get("completion_tokens")
-        or usage.get("outputTokens") or usage.get("output_tokens") or 0
+        or usage.get("outputTokens") or usage.get("output_tokens")
+        or usage.get("candidatesTokenCount") or 0  # Gemini usageMetadata format
     )
     return {"input_tokens": int(inp), "output_tokens": int(out), "total_tokens": int(inp + out)}
 
@@ -572,7 +574,7 @@ class ExecutionParser:
                 except (KeyError, IndexError, TypeError):
                     pass
 
-                usage_raw = _find_usage(lm_json)
+                usage_raw = _find_usage(lm_json) or _find_usage(lm_run.get("data", {}))
                 tokens    = _normalize_usage(usage_raw) if usage_raw else {
                     "input_tokens": 0, "output_tokens": 0, "total_tokens": 0
                 }
