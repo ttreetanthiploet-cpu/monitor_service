@@ -211,6 +211,78 @@ def _extract_http_url_map(execution: dict) -> dict[str, str]:
     return result
 
 
+def _extract_agent_node_map(execution: dict) -> dict[str, dict]:
+    """
+    Auto-detect all AI Agent nodes from workflowData.nodes.
+    Returns {node_name: {agent, workflow}} for every langchain.agent node.
+    """
+    result: dict[str, dict] = {}
+    wf_name = execution.get("workflowData", {}).get("name", "")
+    for node in execution.get("workflowData", {}).get("nodes", []):
+        if "langchain.agent" in node.get("type", "").lower():
+            name = node["name"]
+            result[name] = {"agent": name, "workflow": wf_name}
+    return result
+
+
+def _extract_lm_subnode_map(execution: dict) -> dict[str, str]:
+    """
+    Auto-detect which LM model sub-node connects to which agent node by
+    tracing ai_languageModel connections in workflowData.connections.
+    Returns {agent_node_name: lm_node_name}.
+    """
+    result: dict[str, str] = {}
+    for src, conn_types in execution.get("workflowData", {}).get("connections", {}).items():
+        for targets in (conn_types.get("ai_languageModel") or []):
+            for conn in (targets or []):
+                agent = conn.get("node", "")
+                if agent:
+                    result[agent] = src
+    return result
+
+
+def _extract_chain_node_map(execution: dict, exclude_lm_nodes: set[str]) -> dict[str, dict]:
+    """
+    Find LM model nodes that are sub-nodes of non-agent chain nodes
+    (e.g. Guardrails, Basic LLM Chain) not already covered by agent detection.
+    Returns {lm_node_name: {parent_node, agent, workflow}}.
+    """
+    result: dict[str, dict] = {}
+    wf_name = execution.get("workflowData", {}).get("name", "")
+    node_types = {
+        n["name"]: n.get("type", "")
+        for n in execution.get("workflowData", {}).get("nodes", [])
+    }
+    connections = execution.get("workflowData", {}).get("connections", {})
+
+    # Build reverse main-connection map so we can find each chain node's input source
+    main_input_of: dict[str, str] = {}
+    for src, conn_types in connections.items():
+        for groups in (conn_types.get("main") or []):
+            for conn in (groups or []):
+                target = conn.get("node", "")
+                if target:
+                    main_input_of[target] = src
+
+    for src, conn_types in connections.items():
+        for targets in (conn_types.get("ai_languageModel") or []):
+            for conn in (targets or []):
+                chain_node = conn.get("node", "")
+                if not chain_node:
+                    continue
+                if src in exclude_lm_nodes:
+                    continue  # already captured as agent LM sub-node
+                if "langchain.agent" in node_types.get(chain_node, "").lower():
+                    continue  # agent nodes are handled separately
+                result[src] = {
+                    "parent_node":  chain_node,
+                    "agent":        chain_node,
+                    "workflow":     wf_name,
+                    "input_source": main_input_of.get(chain_node),
+                }
+    return result
+
+
 # ── Main parser ───────────────────────────────────────────────────────────────
 
 class ExecutionParser:
@@ -238,6 +310,16 @@ class ExecutionParser:
         model_map  = _extract_model_map(execution)
         url_map    = _extract_http_url_map(execution)
 
+        # Auto-detect agent nodes and LM connections; registry entries take precedence.
+        auto_agent_map = _extract_agent_node_map(execution)
+        auto_lm_map    = _extract_lm_subnode_map(execution)
+        merged_agent_map = {**auto_agent_map, **wf_config["agent_node_map"]}
+        merged_lm_map    = {**auto_lm_map,    **wf_config["lm_subnode_map"]}
+
+        # Only exclude LM nodes already paired with a detected agent node.
+        covered_lm_nodes = {merged_lm_map[a] for a in merged_agent_map if a in merged_lm_map}
+        chain_node_map = _extract_chain_node_map(execution, exclude_lm_nodes=covered_lm_nodes)
+
         trigger_data = _get_trigger_data(
             run_data,
             wf_config["trigger_node"],
@@ -249,7 +331,10 @@ class ExecutionParser:
             exec_id, workflow_id, status, started_at, finished_at, wall_ms,
             trigger_data, final_output, run_data, wf_config, execution,
         )
-        agent_calls   = self._build_agent_calls(exec_id, run_data, wf_config, model_map)
+        agent_calls = (
+            self._build_agent_calls(exec_id, run_data, merged_agent_map, merged_lm_map, model_map)
+            + self._build_chain_llm_calls(exec_id, run_data, chain_node_map, model_map)
+        )
         http_requests = self._build_http_requests(exec_id, run_data, wf_config, url_map)
         flags         = self._build_flags(exec_id, run_data, wf_config)
 
@@ -391,11 +476,10 @@ class ExecutionParser:
     # ── agent_call_log builder ─────────────────────────────────────────────────
 
     def _build_agent_calls(
-        self, exec_id: str, run_data: dict, wf_config: dict, model_map: dict[str, str]
+        self, exec_id: str, run_data: dict,
+        agent_node_map: dict, lm_subnode_map: dict, model_map: dict[str, str],
     ) -> list[dict]:
         rows = []
-        agent_node_map = wf_config["agent_node_map"]
-        lm_subnode_map = wf_config["lm_subnode_map"]
 
         for node_name, node_runs in run_data.items():
             if node_name not in agent_node_map:
@@ -451,6 +535,72 @@ class ExecutionParser:
                                               if output_data else None,
                                               Config.MAX_RESPONSE_LENGTH,
                                           ),
+                    **tokens,
+                    **cost,
+                })
+
+        return rows
+
+    # ── chain LLM call builder (direct lmChat sub-nodes) ──────────────────────
+
+    def _build_chain_llm_calls(
+        self, exec_id: str, run_data: dict, chain_node_map: dict, model_map: dict[str, str]
+    ) -> list[dict]:
+        rows = []
+
+        for lm_node, meta in chain_node_map.items():
+            lm_runs     = run_data.get(lm_node, [])
+            input_src   = meta.get("input_source")
+            input_runs  = run_data.get(input_src, []) if input_src else []
+
+            for i, lm_run in enumerate(lm_runs):
+                exec_time_ms  = lm_run.get("executionTime", 0) or 0
+                node_started  = parse_dt(lm_run.get("startTime"))
+                node_finished = (
+                    parse_dt(lm_run.get("startTime") + exec_time_ms)
+                    if lm_run.get("startTime") else None
+                )
+
+                # Token usage and generated text live in data["ai_languageModel"]
+                lm_json    = {}
+                output_text = None
+                try:
+                    lm_json = lm_run["data"]["ai_languageModel"][0][0]["json"]
+                    gens    = lm_json.get("response", {}).get("generations", [[]])
+                    if gens and gens[0]:
+                        output_text = gens[0][0].get("text")
+                except (KeyError, IndexError, TypeError):
+                    pass
+
+                usage_raw = _find_usage(lm_json)
+                tokens    = _normalize_usage(usage_raw) if usage_raw else {
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0
+                }
+                cost       = _calc_cost(tokens)
+                model_name = model_map.get(lm_node)
+
+                # Input: the data fed into the chain node from the previous node
+                input_data = None
+                if i < len(input_runs):
+                    try:
+                        input_data = input_runs[i]["data"]["main"][0][0]["json"]
+                    except (KeyError, IndexError, TypeError):
+                        pass
+
+                rows.append({
+                    "execution_id":       exec_id,
+                    "agent_name":         meta["agent"],
+                    "workflow_name":      meta["workflow"],
+                    "model_name":         model_name,
+                    "started_at":         node_started.isoformat()  if node_started  else None,
+                    "finished_at":        node_finished.isoformat() if node_finished else None,
+                    "processing_time_ms": exec_time_ms,
+                    "input_prompt":       _truncate(
+                                              json.dumps(input_data, ensure_ascii=False)
+                                              if input_data else None,
+                                              Config.MAX_PROMPT_LENGTH,
+                                          ),
+                    "output_text":        _truncate(output_text, Config.MAX_RESPONSE_LENGTH),
                     **tokens,
                     **cost,
                 })
