@@ -70,7 +70,7 @@ WORKFLOW_REGISTRY: dict[str, dict] = {
             },
         },
         "lm_subnode_map": {
-            "Debt Solution Extractor": "Google Gemini Chat Model",
+            "Debt Solution Extractor": ["Google Gemini Chat Model"],
         },
         "http_node_map": {
             "HTTP Request": {"workflow": "AdvisorWorkFlow_v1.3"},
@@ -227,19 +227,20 @@ def _extract_agent_node_map(execution: dict) -> dict[str, dict]:
     return result
 
 
-def _extract_lm_subnode_map(execution: dict) -> dict[str, str]:
+def _extract_lm_subnode_map(execution: dict) -> dict[str, list[str]]:
     """
-    Auto-detect which LM model sub-node connects to which agent node by
+    Auto-detect which LM model sub-nodes connect to which agent node by
     tracing ai_languageModel connections in workflowData.connections.
-    Returns {agent_node_name: lm_node_name}.
+    Returns {agent_node_name: [lm_node_name, ...]} — list because an agent
+    can have multiple LM models wired to it (tokens must be summed).
     """
-    result: dict[str, str] = {}
+    result: dict[str, list[str]] = {}
     for src, conn_types in execution.get("workflowData", {}).get("connections", {}).items():
         for targets in (conn_types.get("ai_languageModel") or []):
             for conn in (targets or []):
                 agent = conn.get("node", "")
                 if agent:
-                    result[agent] = src
+                    result.setdefault(agent, []).append(src)
     return result
 
 
@@ -314,12 +315,19 @@ class ExecutionParser:
 
         # Auto-detect agent nodes and LM connections; registry entries take precedence.
         auto_agent_map = _extract_agent_node_map(execution)
-        auto_lm_map    = _extract_lm_subnode_map(execution)
+        auto_lm_map    = _extract_lm_subnode_map(execution)  # {agent: [lm, ...]}
         merged_agent_map = {**auto_agent_map, **wf_config["agent_node_map"]}
-        merged_lm_map    = {**auto_lm_map,    **wf_config["lm_subnode_map"]}
 
-        # Only exclude LM nodes already paired with a detected agent node.
-        covered_lm_nodes = {merged_lm_map[a] for a in merged_agent_map if a in merged_lm_map}
+        # Normalise registry lm_subnode_map values to lists then merge.
+        merged_lm_map: dict[str, list[str]] = {**auto_lm_map}
+        for agent, val in wf_config["lm_subnode_map"].items():
+            merged_lm_map[agent] = [val] if isinstance(val, str) else list(val)
+
+        # Flatten to get the set of LM nodes already covered by agent detection.
+        covered_lm_nodes = {
+            lm for a in merged_agent_map if a in merged_lm_map
+            for lm in merged_lm_map[a]
+        }
         chain_node_map = _extract_chain_node_map(execution, exclude_lm_nodes=covered_lm_nodes)
 
         trigger_data = _get_trigger_data(
@@ -487,9 +495,10 @@ class ExecutionParser:
             if node_name not in agent_node_map:
                 continue
 
-            meta       = agent_node_map[node_name]
-            lm_subnode = lm_subnode_map.get(node_name)
-            lm_runs    = run_data.get(lm_subnode, []) if lm_subnode else []
+            meta        = agent_node_map[node_name]
+            lm_subnodes = lm_subnode_map.get(node_name) or []
+            if isinstance(lm_subnodes, str):
+                lm_subnodes = [lm_subnodes]
 
             for i, run in enumerate(node_runs):
                 exec_time_ms  = run.get("executionTime", 0) or 0
@@ -499,18 +508,30 @@ class ExecutionParser:
                     if run.get("startTime") else None
                 )
 
-                # Token usage: prefer the paired LM sub-node's ai_languageModel slot
-                usage_raw = None
-                if i < len(lm_runs):
-                    usage_raw = _find_usage(lm_runs[i].get("data", {}))
-                if usage_raw is None:
-                    usage_raw = _find_usage(run.get("data", {}))
+                # Sum token usage across ALL connected LM sub-nodes for this run.
+                total_inp = total_out = 0
+                for lm_name in lm_subnodes:
+                    lm_runs = run_data.get(lm_name, [])
+                    if i < len(lm_runs):
+                        ur = _find_usage(lm_runs[i].get("data", {}))
+                        if ur:
+                            n = _normalize_usage(ur)
+                            total_inp += n["input_tokens"]
+                            total_out += n["output_tokens"]
 
-                tokens = _normalize_usage(usage_raw) if usage_raw else {
-                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0
-                }
+                # Fallback: search the agent node's own run data
+                if total_inp == 0 and total_out == 0:
+                    ur = _find_usage(run.get("data", {}))
+                    if ur:
+                        n = _normalize_usage(ur)
+                        total_inp, total_out = n["input_tokens"], n["output_tokens"]
+
+                tokens = {"input_tokens": total_inp, "output_tokens": total_out,
+                          "total_tokens": total_inp + total_out}
                 cost       = _calc_cost(tokens)
-                model_name = model_map.get(lm_subnode) if lm_subnode else None
+                model_name = (
+                    ", ".join(filter(None, (model_map.get(n) for n in lm_subnodes))) or None
+                )
 
                 input_data = output_data = None
                 try:
