@@ -13,9 +13,10 @@ Or via the entry-point defined in pyproject.toml:
 import logging
 import time
 import sys
+from datetime import datetime, timezone, timedelta
 
 from .config import Config
-from .n8n_client import N8NClient
+from .n8n_client import N8NClient, parse_dt
 from .parser import ExecutionParser
 from .supabase_writer import SupabaseWriter
 
@@ -58,9 +59,17 @@ def poll_once(client: N8NClient, parser: ExecutionParser, writer: SupabaseWriter
 
         log.info("  Processing %d new execution(s) for %s...", len(executions), workflow_id)
         processed = 0
+        write_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
 
         for exec_item in executions:
             exec_id = exec_item.get("id", "unknown")
+            started = parse_dt(exec_item.get("startedAt"))
+            if started is None or started < write_cutoff:
+                log.info(
+                    "  Skipping %s — started at %s (older than 15 min).",
+                    exec_id, exec_item.get("startedAt"),
+                )
+                continue
             try:
                 parsed = parser.parse(exec_item)
                 writer.write(parsed)

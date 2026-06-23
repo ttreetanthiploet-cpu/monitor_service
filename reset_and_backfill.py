@@ -40,8 +40,8 @@ _DELETE_ORDER = [
 
 
 def cutoff_utc() -> datetime:
-    """Return exactly 1 hour ago as a UTC-aware datetime."""
-    return datetime.now(timezone.utc) - timedelta(hours=1)
+    """Return exactly 10 minutes ago as a UTC-aware datetime."""
+    return datetime.now(timezone.utc) - timedelta(minutes=10)
 
 
 def clear_tables(writer: SupabaseWriter) -> None:
@@ -50,7 +50,9 @@ def clear_tables(writer: SupabaseWriter) -> None:
     for table in _DELETE_ORDER:
         try:
             # Delete all rows; service-role key bypasses RLS
-            result = client.table(table).delete().neq("execution_id", "").execute()
+            result = client.table(table).delete().not_.is_("execution_id", None).execute()
+            # Also catch rows with empty execution_id
+            client.table(table).delete().eq("execution_id", "").execute()
             log.info("  %-30s cleared", table)
         except Exception as e:
             log.error("  Failed to clear %s: %s", table, e)
@@ -101,13 +103,13 @@ def main() -> None:
     args = parser.parse_args()
 
     cutoff = cutoff_utc()
-    log.info("Cutoff (last 1 hour, UTC): %s", cutoff.isoformat())
+    log.info("Cutoff (last 10 minutes, UTC): %s", cutoff.isoformat())
     log.info("Workflows to backfill: %s", ", ".join(Config.N8N_WORKFLOW_IDS))
 
     if not args.yes:
         answer = input(
             "\nThis will DELETE all rows from all 4 monitoring tables and "
-            "re-populate them with the last 1 hour of executions only.\nType 'yes' to continue: "
+            "re-populate them with the last 10 minutes of executions only.\nType 'yes' to continue: "
         )
         if answer.strip().lower() != "yes":
             print("Aborted.")
@@ -134,9 +136,15 @@ def main() -> None:
         log.info("  Found %d execution(s) — writing...", len(execs))
         written = 0
 
+        write_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+
         # Write oldest-first so FK parent (execution_log) is always inserted first
         for exec_item in reversed(execs):
             exec_id = exec_item.get("id", "?")
+            started = parse_dt(exec_item.get("startedAt"))
+            if started is None or started < write_cutoff:
+                log.info("  Skipping %s — started at %s (older than 15 min).", exec_id, exec_item.get("startedAt"))
+                continue
             try:
                 parsed = ep.parse(exec_item)
                 writer.write(parsed)
